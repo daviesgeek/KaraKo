@@ -218,7 +218,51 @@ function EpubBuilder.buildDocument(bookmark, body_html)
     return table.concat(parts, "\n")
 end
 
-local function opf(bookmark, title, images)
+-- KaraKo cover JPEG normalization (2026-10)
+-- WebP is not a core image format in EPUB 2. Use KOReader's own decoder
+-- and JPEG encoder, keeping the cover out of the XHTML spine.
+-- If conversion fails, omit the cover rather than producing invalid EPUB 2.
+local function karakoCoverToJpeg(data)
+    local ok_render, bb = pcall(function()
+        local RenderImage = require("ui/renderimage")
+        return RenderImage:renderImageData(data, #data)
+    end)
+    if not ok_render or not bb then
+        print("KaraKo: cannot decode WebP banner for JPEG cover")
+        return nil
+    end
+
+    local tmp = os.tmpname()
+    if not tmp then
+        pcall(function() bb:free() end)
+        return nil
+    end
+    -- Use a JPG suffix for tooling that chooses output format by extension.
+    local path = tmp .. ".jpg"
+    os.remove(tmp)
+    local ok_write, wrote = pcall(function()
+        return bb:writeToFile(path, "jpg", 85)
+    end)
+    pcall(function() bb:free() end)
+    local converted
+    if ok_write and wrote then
+        local f = io.open(path, "rb")
+        if f then
+            converted = f:read("*a")
+            f:close()
+        end
+    end
+    os.remove(path)
+    if converted and #converted <= 2 * 1024 * 1024
+            and converted:sub(1, 3) == string.char(255, 216, 255) then
+        return converted
+    end
+    print("KaraKo: failed to encode valid JPEG cover")
+    return nil
+end
+
+local function opf(bookmark, title, images, cover_path, cover_type)
+-- KaraKo publication + cover patch (2026-10)
     local content = bookmark.content or {}
     local parts = {
         [[<?xml version="1.0" encoding="UTF-8"?>]],
@@ -234,6 +278,7 @@ local function opf(bookmark, title, images)
     end
     if content.publisher and content.publisher ~= "" then
         table.insert(parts, "<dc:publisher>" .. ArticleUtil.escapeXml(content.publisher) .. "</dc:publisher>")
+        table.insert(parts, '<meta name="calibre:series" content="' .. ArticleUtil.escapeXml(content.publisher) .. '"/>')
     end
     if content.url and content.url ~= "" then
         table.insert(parts, "<dc:source>" .. ArticleUtil.escapeXml(content.url) .. "</dc:source>")
@@ -247,6 +292,9 @@ local function opf(bookmark, title, images)
         end
     end
 
+    if cover_path then
+        table.insert(parts, '<meta name="cover" content="cover-image"/>')
+    end
     table.insert(parts, "</metadata>")
     table.insert(parts, "<manifest>")
     table.insert(parts, [[<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>]])
@@ -258,6 +306,10 @@ local function opf(bookmark, title, images)
             index, ArticleUtil.escapeXml(image.path), image.media_type))
     end
 
+    if cover_path then
+        table.insert(parts, string.format('<item id="cover-image" href="%s" media-type="%s"/>',
+            cover_path, cover_type))
+    end
     table.insert(parts, "</manifest>")
     table.insert(parts, [[<spine toc="ncx"><itemref idref="content"/></spine>]])
     table.insert(parts, "</package>")
@@ -365,6 +417,20 @@ function EpubBuilder.build(bookmark, filepath, opts)
         end)
     end
 
+    -- An independently embedded cover does not change the article body or
+    -- interfere with the regular inline-image count/budget.
+    local cover_extensions = {
+        ["image/jpeg"] = "jpg", ["image/png"] = "png",
+        ["image/gif"] = "gif", ["image/webp"] = "webp",
+    }
+    local cover_data = opts.cover_data
+    local cover_type = cover_data and ArticleUtil.sniffImageType(cover_data)
+    if cover_type == "image/webp" then
+        cover_data = karakoCoverToJpeg(cover_data)
+        cover_type = cover_data and "image/jpeg" or nil
+    end
+    local cover_ext = cover_type and cover_extensions[cover_type]
+    local cover_path = cover_ext and ("images/cover." .. cover_ext) or nil
     local document = EpubBuilder.buildDocument(bookmark, body_html)
 
     -- Assemble the whole document before balancing it. getBalancedHTML() parses
@@ -431,7 +497,7 @@ function EpubBuilder.build(bookmark, filepath, opts)
 
     addEntry("OEBPS/stylesheet.css", CSS)
     addEntry("OEBPS/content.xhtml", xhtml)
-    addEntry("OEBPS/content.opf", opf(bookmark, title, images))
+    addEntry("OEBPS/content.opf", opf(bookmark, title, images, cover_path, cover_type))
     addEntry("OEBPS/toc.ncx", ncx(bookmark, title))
 
     -- Already-compressed formats gain nothing from deflate, and the Kobo's CPU
@@ -440,6 +506,10 @@ function EpubBuilder.build(bookmark, filepath, opts)
     for _, image in ipairs(images) do
         addEntry("OEBPS/" .. image.path, image_data[image.path])
         image_data[image.path] = nil -- release as we go
+    end
+
+    if cover_path then
+        addEntry("OEBPS/" .. cover_path, cover_data)
     end
 
     writer:close()

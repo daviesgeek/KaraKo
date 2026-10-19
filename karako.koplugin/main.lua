@@ -1374,9 +1374,31 @@ function KaraKo:downloadArticle(api, bookmark, existing_path)
     local filepath = existing_path
         or ffiUtil.joinPath(self.directory, ArticleUtil.buildFilename(bookmark.id, title))
 
+    -- KaraKo publication + cover patch (2026-10)
+    -- Prefer Karakeep's actual bannerImage asset; older API responses may
+    -- expose the preferred banner as content.imageAssetId instead.
+    local cover_asset_id
+    local asset_sets = { content.assets or {}, bookmark.assets or {} }
+    for _, assets in ipairs(asset_sets) do
+        for _, asset in ipairs(assets) do
+            if asset.assetType == "bannerImage" and asset.id then
+                cover_asset_id = asset.id
+                break
+            end
+        end
+        if cover_asset_id then break end
+    end
+    cover_asset_id = cover_asset_id or content.imageAssetId
+    local cover_data
+    if cover_asset_id then
+        -- Uses KaraKo's existing authenticated Karakeep asset client.
+        -- Covers are limited independently from article inline images.
+        cover_data = self:fetchAsset(api, cover_asset_id, 2 * 1024 * 1024)
+    end
     local ok, err = EpubBuilder.build(bookmark, filepath, {
         body_html = body_html,
         include_images = self.download_images,
+        cover_data = cover_data,
         max_images = self.max_images,
         -- Returned, not discarded: Trapper:info() answers false when the reader
         -- taps to cancel, which abandons the build rather than making them wait
