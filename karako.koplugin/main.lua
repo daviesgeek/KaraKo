@@ -275,6 +275,7 @@ function KaraKo:loadSettings()
     self.directory = self.settings:readSetting("directory")
 
     self.articles_per_sync = self.settings:readSetting("articles_per_sync", 30)
+    self.download_order = self.settings:readSetting("download_order", "published")
     self.sync_scope = self.settings:readSetting("sync_scope", "all")
     self.scope_id = self.settings:readSetting("scope_id")
     self.scope_name = self.settings:readSetting("scope_name")
@@ -303,6 +304,7 @@ function KaraKo:onFlushSettings()
         self.settings:saveSetting("api_token", self.api_token)
         self.settings:saveSetting("directory", self.directory)
         self.settings:saveSetting("articles_per_sync", self.articles_per_sync)
+        self.settings:saveSetting("download_order", self.download_order)
         self.settings:saveSetting("sync_scope", self.sync_scope)
         self.settings:saveSetting("scope_id", self.scope_id)
         self.settings:saveSetting("scope_name", self.scope_name)
@@ -409,6 +411,21 @@ Editing the file later does nothing by itself -- choose "Reload it now" to pull 
                 end,
                 keep_menu_open = true,
                 callback = function(touchmenu_instance) self:setArticlesPerSync(touchmenu_instance) end,
+            },
+            {
+                text_func = function()
+                    return self.download_order == "published"
+                        and _("Article order: Newest published")
+                        or _("Article order: Newest added")
+                end,
+                help_text = _([[Newest published: scan the whole chosen Karakeep list/tag, sort by original publication date, then download up to your limit. Missing publication dates fall back to the date added to Karakeep. This may take longer for large lists.
+Newest added: original KaraKo behavior, fetching recently saved bookmarks first.]]),
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    self.download_order = self.download_order == "published" and "added" or "published"
+                    self:onFlushSettings()
+                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                end,
             },
             {
                 text = _("Download folder"),
@@ -1100,6 +1117,8 @@ function KaraKo:synchronize(quiet, force_redownload)
         Trapper:reset()
         UIManager:show(InfoMessage:new{
             text = err == "network_error" and _("Could not reach the Karakeep server.")
+                or err == "published_scan_limit" and _("Too many bookmarks to sort by publication date. Select a smaller Karakeep list or tag, or choose Newest added.")
+                or err == "published_scan_cursor" and _("Karakeep returned invalid pagination. Publication-date sync stopped safely; try again.")
                 or _("Could not fetch articles from Karakeep."),
         })
         return
@@ -1202,6 +1221,76 @@ end
 -- The per-sync cap tops out at 200 and a page holds up to 100, so a healthy
 -- server never needs more than a handful of pages.
 local MAX_BOOKMARK_PAGES = 10
+-- KaraKo publication-first download order (2026-10)
+-- Karakeep's list endpoint sorts by bookmark creation date only, so scanning
+-- the complete selected scope is required to find the newest *published* items.
+-- Do not silently pretend a partial scan is a correct global ranking.
+local MAX_PUBLISHED_BOOKMARK_PAGES = 50 -- at most 5000 server entries per sync
+
+local function karakoArticleDate(bookmark)
+    local content = bookmark.content or {}
+    local published = content.datePublished
+    if type(published) == "string" then
+        local date = published:match("^(%d%d%d%d%-%d%d%-%d%d)")
+        if date then return date end
+    end
+    local added = bookmark.createdAt
+    return type(added) == "string" and added:sub(1, 10) or ""
+end
+
+function KaraKo:fetchBookmarksByPublicationDate(api)
+    local all, cursor, pages = {}, nil, 0
+    local seen_cursors = {}
+
+    repeat
+        pages = pages + 1
+        local ok, result = api:getBookmarkPage{
+            scope = self.sync_scope,
+            scope_id = self.scope_id,
+            limit = 100,
+            cursor = cursor,
+        }
+        if not ok then return nil, result, false end
+        for _, bookmark in ipairs(result.bookmarks or {}) do
+            if not bookmark.archived and self:isReadable(bookmark) then
+                all[#all + 1] = bookmark
+            end
+        end
+        cursor = result.nextCursor
+        if cursor ~= nil then
+            if type(cursor) ~= "string" or cursor == "" or seen_cursors[cursor] then
+                logger.warn("KaraKo: invalid/repeated cursor in publication-date scan")
+                return nil, "published_scan_cursor", false
+            end
+            seen_cursors[cursor] = true
+            if pages >= MAX_PUBLISHED_BOOKMARK_PAGES then
+                logger.warn("KaraKo: publication-date scan exceeded", MAX_PUBLISHED_BOOKMARK_PAGES,
+                    "pages; narrow the Karakeep list/tag before syncing")
+                return nil, "published_scan_limit", false
+            end
+        end
+    until not cursor
+
+    table.sort(all, function(a, b)
+        local da, db = karakoArticleDate(a), karakoArticleDate(b)
+        if da ~= db then return da > db end
+        -- Keep ordering deterministic within the same publication date.
+        local ca, cb = a.createdAt or "", b.createdAt or ""
+        if ca ~= cb then return ca > cb end
+        return tostring(a.id or "") < tostring(b.id or "")
+    end)
+
+    local complete = #all <= self.articles_per_sync
+    while #all > self.articles_per_sync do
+        all[#all] = nil
+    end
+    logger.info("KaraKo: publication sort scanned", pages, "pages; selected", #all,
+        "bookmarks; full scope fits limit:", tostring(complete))
+    -- On a truncated result, 'complete' must be false. Otherwise the caller
+    -- could delete local articles not included in the selected top N.
+    return all, nil, complete
+end
+
 
 --- Fetch bookmarks for the configured scope, following pagination.
 -- @treturn table|nil Array of bookmarks.
@@ -1209,6 +1298,9 @@ local MAX_BOOKMARK_PAGES = 10
 -- @treturn bool Whether the whole scope was seen, rather than cut off by the
 --   per-sync cap. Callers must not delete local files unless this is true.
 function KaraKo:fetchBookmarks(api)
+    if self.download_order == "published" then
+        return self:fetchBookmarksByPublicationDate(api)
+    end
     local bookmarks = {}
     local cursor = nil
     local pages = 0
