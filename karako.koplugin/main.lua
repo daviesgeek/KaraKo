@@ -296,6 +296,26 @@ function KaraKo:loadSettings()
     self.auto_sync = self.settings:readSetting("auto_sync", false)
     self.auto_sync_interval = self.settings:readSetting("auto_sync_interval", 30)
     self.last_auto_sync = self.settings:readSetting("last_auto_sync")
+    -- Migrate the previous single-list selection ONCE; afterwards there is
+    -- no legacy single-list mode and no global sorting mode.
+    local saved_profiles = self.settings:readSetting("sync_profiles")
+    if type(saved_profiles) == "table" then
+        self.sync_profiles = saved_profiles
+    else
+        self.sync_profiles = {}
+        if self.sync_scope == "list" and self.scope_id then
+            self.sync_profiles[1] = {
+                list_id = tostring(self.scope_id),
+                name = self.scope_name or tostring(self.scope_id),
+                enabled = true,
+                order = self.download_order == "added" and "created_desc" or "published_desc",
+                max_articles = self.articles_per_sync,
+            }
+        end
+        self.settings:saveSetting("sync_profiles", self.sync_profiles)
+        self.settings:flush()
+    end
+
 end
 
 function KaraKo:onFlushSettings()
@@ -304,7 +324,7 @@ function KaraKo:onFlushSettings()
         self.settings:saveSetting("api_token", self.api_token)
         self.settings:saveSetting("directory", self.directory)
         self.settings:saveSetting("articles_per_sync", self.articles_per_sync)
-        self.settings:saveSetting("download_order", self.download_order)
+        self.settings:saveSetting("sync_profiles", self.sync_profiles)
         self.settings:saveSetting("sync_scope", self.sync_scope)
         self.settings:saveSetting("scope_id", self.scope_id)
         self.settings:saveSetting("scope_name", self.scope_name)
@@ -400,31 +420,16 @@ Editing the file later does nothing by itself -- choose "Reload it now" to pull 
             },
             {
                 text_func = function()
-                    return T(_("What to sync: %1"), self:describeScope())
-                end,
-                keep_menu_open = true,
-                sub_item_table_func = function() return self:scopeMenu() end,
-            },
-            {
-                text_func = function()
-                    return T(_("Articles per sync: %1"), self.articles_per_sync)
+                    return T(_("Total active articles: %1"), self.articles_per_sync)
                 end,
                 keep_menu_open = true,
                 callback = function(touchmenu_instance) self:setArticlesPerSync(touchmenu_instance) end,
             },
             {
-                text_func = function()
-                    return self.download_order == "published"
-                        and _("Article order: Newest published")
-                        or _("Article order: Newest added")
-                end,
-                help_text = _([[Newest published: scan the whole chosen Karakeep list/tag, sort by original publication date, then download up to your limit. Missing publication dates fall back to the date added to Karakeep. This may take longer for large lists.
-Newest added: original KaraKo behavior, fetching recently saved bookmarks first.]]),
+                text = _("Sync sources"),
                 keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    self.download_order = self.download_order == "published" and "added" or "published"
-                    self:onFlushSettings()
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
+                sub_item_table_func = function()
+                    return dofile(self.path .. "/syncprofilesmenu.lua").build(self)
                 end,
             },
             {
@@ -534,101 +539,7 @@ Highlights are matched to the article by their text, because KOReader and Karake
     }
 end
 
-function KaraKo:describeScope()
-    if self.sync_scope == "list" then
-        return T(_("list '%1'"), self.scope_name or self.scope_id or "?")
-    elseif self.sync_scope == "tag" then
-        return T(_("tag '%1'"), self.scope_name or self.scope_id or "?")
-    end
-    return _("all unread")
-end
-
-function KaraKo:scopeMenu()
-    return {
-        {
-            text = _("All unarchived bookmarks"),
-            checked_func = function() return self.sync_scope == "all" end,
-            callback = function()
-                self.sync_scope = "all"
-                self.scope_id = nil
-                self.scope_name = nil
-            end,
-        },
-        {
-            text = _("A single list…"),
-            keep_menu_open = true,
-            checked_func = function() return self.sync_scope == "list" end,
-            callback = function(touchmenu_instance) self:chooseScope("list", touchmenu_instance) end,
-        },
-        {
-            text = _("A single tag…"),
-            keep_menu_open = true,
-            checked_func = function() return self.sync_scope == "tag" end,
-            callback = function(touchmenu_instance) self:chooseScope("tag", touchmenu_instance) end,
-        },
-    }
-end
-
 --- Fetch the available lists or tags from the server and let the user pick one.
-function KaraKo:chooseScope(kind, touchmenu_instance)
-    if self.server_url == "" or self.api_token == "" then
-        UIManager:show(InfoMessage:new{ text = _("Configure the server first.") })
-        return
-    end
-
-    NetworkMgr:runWhenOnline(function()
-        local api = self:getApi()
-        local ok, items
-        if kind == "list" then
-            ok, items = api:getLists()
-        else
-            ok, items = api:getTags()
-        end
-
-        if not ok then
-            UIManager:show(InfoMessage:new{ text = _("Could not fetch the list from Karakeep.") })
-            return
-        end
-
-        if #items == 0 then
-            UIManager:show(InfoMessage:new{
-                text = kind == "list" and _("This Karakeep account has no lists.")
-                    or _("This Karakeep account has no tags."),
-            })
-            return
-        end
-
-        local Menu = require("ui/widget/menu")
-        local Screen = require("device").screen
-        local entries = {}
-        local chooser
-
-        for _, item in ipairs(items) do
-            table.insert(entries, {
-                text = item.name or item.id,
-                callback = function()
-                    self.sync_scope = kind
-                    self.scope_id = item.id
-                    self.scope_name = item.name
-                    UIManager:close(chooser)
-                    if touchmenu_instance then touchmenu_instance:updateItems() end
-                end,
-            })
-        end
-
-        table.sort(entries, function(a, b) return a.text < b.text end)
-
-        chooser = Menu:new{
-            title = kind == "list" and _("Choose a list") or _("Choose a tag"),
-            item_table = entries,
-            width = Screen:getWidth(),
-            height = Screen:getHeight(),
-            close_callback = function() UIManager:close(chooser) end,
-        }
-        UIManager:show(chooser)
-    end)
-end
-
 --- Menu for the optional config file.
 function KaraKo:configFileMenu()
     return {
@@ -773,7 +684,7 @@ end
 
 function KaraKo:setArticlesPerSync(touchmenu_instance)
     UIManager:show(SpinWidget:new{
-        title_text = _("Articles per sync"),
+        title_text = _("Total active articles"),
         info_text = _("The most recent unread articles are fetched, up to this many. Local copies are only tidied up when a sync sees everything, so a limit smaller than your unread count leaves them alone."),
         value = self.articles_per_sync,
         value_min = 1,
@@ -1221,136 +1132,25 @@ end
 -- The per-sync cap tops out at 200 and a page holds up to 100, so a healthy
 -- server never needs more than a handful of pages.
 local MAX_BOOKMARK_PAGES = 10
--- KaraKo publication-first download order (2026-10)
--- Karakeep's list endpoint sorts by bookmark creation date only, so scanning
--- the complete selected scope is required to find the newest *published* items.
--- Do not silently pretend a partial scan is a correct global ranking.
-local MAX_PUBLISHED_BOOKMARK_PAGES = 50 -- at most 5000 server entries per sync
-
-local function karakoArticleDate(bookmark)
-    local content = bookmark.content or {}
-    local published = content.datePublished
-    if type(published) == "string" then
-        local date = published:match("^(%d%d%d%d%-%d%d%-%d%d)")
-        if date then return date end
-    end
-    local added = bookmark.createdAt
-    return type(added) == "string" and added:sub(1, 10) or ""
-end
-
-function KaraKo:fetchBookmarksByPublicationDate(api)
-    local all, cursor, pages = {}, nil, 0
-    local seen_cursors = {}
-
-    repeat
-        pages = pages + 1
-        local ok, result = api:getBookmarkPage{
-            scope = self.sync_scope,
-            scope_id = self.scope_id,
-            limit = 100,
-            cursor = cursor,
-        }
-        if not ok then return nil, result, false end
-        for _, bookmark in ipairs(result.bookmarks or {}) do
-            if not bookmark.archived and self:isReadable(bookmark) then
-                all[#all + 1] = bookmark
-            end
-        end
-        cursor = result.nextCursor
-        if cursor ~= nil then
-            if type(cursor) ~= "string" or cursor == "" or seen_cursors[cursor] then
-                logger.warn("KaraKo: invalid/repeated cursor in publication-date scan")
-                return nil, "published_scan_cursor", false
-            end
-            seen_cursors[cursor] = true
-            if pages >= MAX_PUBLISHED_BOOKMARK_PAGES then
-                logger.warn("KaraKo: publication-date scan exceeded", MAX_PUBLISHED_BOOKMARK_PAGES,
-                    "pages; narrow the Karakeep list/tag before syncing")
-                return nil, "published_scan_limit", false
-            end
-        end
-    until not cursor
-
-    table.sort(all, function(a, b)
-        local da, db = karakoArticleDate(a), karakoArticleDate(b)
-        if da ~= db then return da > db end
-        -- Keep ordering deterministic within the same publication date.
-        local ca, cb = a.createdAt or "", b.createdAt or ""
-        if ca ~= cb then return ca > cb end
-        return tostring(a.id or "") < tostring(b.id or "")
-    end)
-
-    local complete = #all <= self.articles_per_sync
-    while #all > self.articles_per_sync do
-        all[#all] = nil
-    end
-    logger.info("KaraKo: publication sort scanned", pages, "pages; selected", #all,
-        "bookmarks; full scope fits limit:", tostring(complete))
-    -- On a truncated result, 'complete' must be false. Otherwise the caller
-    -- could delete local articles not included in the selected top N.
-    return all, nil, complete
-end
-
-
---- Fetch bookmarks for the configured scope, following pagination.
--- @treturn table|nil Array of bookmarks.
--- @treturn string|nil Error code.
--- @treturn bool Whether the whole scope was seen, rather than cut off by the
---   per-sync cap. Callers must not delete local files unless this is true.
 function KaraKo:fetchBookmarks(api)
-    if self.download_order == "published" then
-        return self:fetchBookmarksByPublicationDate(api)
+    -- KaraKo unified multi-source selection (2026-10)
+    local profiles = dofile(self.path .. "/syncprofiles.lua")
+    local bookmarks, err, complete, summaries = profiles.select(
+        api, self.sync_profiles, self.articles_per_sync,
+        function(bookmark) return self:isReadable(bookmark) end)
+    self._source_date_order = {}
+    for _, bookmark in ipairs(bookmarks or {}) do
+        self._source_date_order[tostring(bookmark.id)] = bookmark._karako_order
     end
-    local bookmarks = {}
-    local cursor = nil
-    local pages = 0
-
-    repeat
-        pages = pages + 1
-
-        local ok, result = api:getBookmarkPage{
-            scope = self.sync_scope,
-            scope_id = self.scope_id,
-            limit = math.min(self.articles_per_sync, 100),
-            cursor = cursor,
-        }
-
-        if not ok then
-            return nil, result, false
+    if summaries then
+        for _, s in ipairs(summaries) do
+            logger.info("KaraKo: source", s.name, "eligible", s.candidates,
+                "selected", s.selected, "pages", s.pages)
         end
-
-        for _, bookmark in ipairs(result.bookmarks or {}) do
-            -- The list and tag endpoints cannot filter server-side, so archived
-            -- bookmarks are dropped here.
-            if not bookmark.archived and self:isReadable(bookmark) then
-                table.insert(bookmarks, bookmark)
-                if #bookmarks >= self.articles_per_sync then
-                    return bookmarks, nil, false
-                end
-            end
-        end
-
-        cursor = result.nextCursor
-
-        -- Only a string can go into a query; buildQuery() drops anything else,
-        -- and we would then re-request the first page for ever.
-        if cursor ~= nil and type(cursor) ~= "string" then
-            logger.warn("KaraKo: ignoring a nextCursor of type", type(cursor))
-            cursor = nil
-        end
-
-        -- Belt and braces against a server that keeps handing back the same
-        -- cursor. Reporting the scope as incomplete is what stops the caller
-        -- deleting local files on the strength of a partial answer.
-        if cursor and pages >= MAX_BOOKMARK_PAGES then
-            logger.warn("KaraKo: stopping after", pages, "pages with a cursor still set")
-            return bookmarks, nil, false
-        end
-    until not cursor
-
-    return bookmarks, nil, true
+    end
+    if err then logger.warn("KaraKo: multi-source scan:", err) end
+    return bookmarks, err, complete
 end
-
 --- Is there anything worth putting on the device?
 -- Asset bookmarks (uploaded PDFs and images) and empty notes are skipped.
 function KaraKo:isReadable(bookmark)
