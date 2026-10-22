@@ -31,6 +31,20 @@ local _ = require("gettext")
 local N_ = _.ngettext
 local T = ffiUtil.template
 
+-- os.clock() measures CPU time, not the time spent waiting for HTTP requests.
+local socket = require("socket")
+local syncNow = socket.gettime or os.time
+
+local function syncDuration(seconds)
+    seconds = math.max(0, seconds or 0)
+    if seconds < 60 then return string.format("%.1fs", seconds) end
+    local whole = math.floor(seconds)
+    if whole < 3600 then
+        return string.format("%dm%02ds", math.floor(whole / 60), whole % 60)
+    end
+    return string.format("%dh%02dm", math.floor(whole / 3600), math.floor(whole / 60) % 60)
+end
+
 local ArticleUtil = require("articleutil")
 local Config = require("config")
 local EpubBuilder = require("epubbuilder")
@@ -1051,6 +1065,7 @@ end
 function KaraKo:synchronize(quiet, force_redownload)
     local Trapper = require("ui/trapper")
     local api = self:getApi()
+    local sync_started = syncNow()
 
     local writable, problem = self:checkDirectory()
     if not writable then
@@ -1061,16 +1076,16 @@ function KaraKo:synchronize(quiet, force_redownload)
     end
 
     local local_articles = self:getLocalArticles()
-
-    -- Before anything reads or writes these paths: bring names written by
-    -- earlier versions up to date, so the rest of the sync works on the paths
-    -- that will still exist afterwards.
     self:renameLegacyArticles(local_articles)
 
-    -- Upload first: an article archived now drops out of the list we are about
-    -- to fetch, so we never re-download something we have just finished.
+    -- Upload first as before, so newly archived articles are not downloaded.
     local archived, upload_failed = self:uploadStatuses(local_articles, true)
 
+    -- KOReader's Trapper pauses on a tap and asks Stop or Continue. A stop
+    -- exits just the remaining downloads: previously saved EPUBs are kept.
+    Trapper:setPausedText(
+        _("Stop downloading articles? Saved EPUBs will be kept."),
+        _("Stop downloading"), _("Continue downloading"))
     Trapper:info(_("Fetching your Karakeep articles…"))
 
     logger.info(string.format("KaraKo: syncing scope=%s%s limit=%d from %s",
@@ -1079,7 +1094,10 @@ function KaraKo:synchronize(quiet, force_redownload)
         self.articles_per_sync,
         self.server_url))
 
+    local list_started = syncNow()
     local remote, err, complete = self:fetchBookmarks(api)
+    local list_seconds = syncNow() - list_started
+    logger.info(string.format("KaraKo timing: listing %.2fs", list_seconds))
     if not remote then
         logger.err("KaraKo: fetch failed:", tostring(err))
         Trapper:reset()
@@ -1092,62 +1110,120 @@ function KaraKo:synchronize(quiet, force_redownload)
         return
     end
 
-    -- Record what the server holds before downloading anything, so that
-    -- cancelling half way through does not make the rest look deleted.
-    local remote_ids = {}
-    for _, bookmark in ipairs(remote) do
-        remote_ids[bookmark.id] = true
+    -- A tap while fetching the list should not trigger another download.
+    if Trapper:info() == false then
+        Trapper:reset()
+        UIManager:show(InfoMessage:new{ text = _("Download stopped. No articles were deleted.") })
+        return
     end
 
-    local downloaded, failed, skipped = 0, 0, 0
+    local remote_ids = {}
+    for _, bookmark in ipairs(remote) do remote_ids[bookmark.id] = true end
+
+    local downloaded, failed, skipped, empty = 0, 0, 0, 0
     local cancelled = false
     local first_failure
+    local attempt_seconds, content_seconds, cover_seconds = 0, 0, 0
+    local image_seconds, epub_seconds = 0, 0
+    local last_seconds, longest_seconds, longest_title = nil, 0, nil
+
+    local function showProgress(index, title, stage, started, metrics)
+        metrics = metrics or {}
+        local tried = downloaded + failed + empty
+        local average = tried > 0 and attempt_seconds / tried or 0
+        local image_time = image_seconds + (metrics.image_seconds or 0)
+        local image_count = metrics.images_attempted or 0
+        return string.format(
+            "%d/%d: %s\n\n%s\n\n"
+            .. "Saved %d  Empty %d  Failed %d  Existing %d\n"
+            .. "Elapsed %s  Current %s  Avg %s\n"
+            .. "List %s  Content %s  Cover %s\n"
+            .. "Images %s  EPUB %s  Current images %d\n\n"
+            .. "Tap to stop downloading",
+            index, #remote, title, stage,
+            downloaded, empty, failed, skipped,
+            syncDuration(syncNow() - sync_started),
+            syncDuration(syncNow() - started), syncDuration(average),
+            syncDuration(list_seconds),
+            syncDuration(content_seconds + (metrics.content_seconds or 0)),
+            syncDuration(cover_seconds + (metrics.cover_seconds or 0)),
+            syncDuration(image_time), syncDuration(epub_seconds), image_count)
+    end
 
     for index, bookmark in ipairs(remote) do
         local existing = local_articles[bookmark.id]
-
         if existing and not force_redownload then
             skipped = skipped + 1
         else
             local content = bookmark.content or {}
             local title = ArticleUtil.displayText(
                 bookmark.title or content.title or content.url, _("Untitled"))
-
+            local started = syncNow()
             logger.dbg("KaraKo: downloading", bookmark.id, title)
 
-            local go_on = Trapper:info(T(_("Downloading %1 of %2:\n\n%3"), index, #remote, title))
-            if not go_on then
+            if not Trapper:info(showProgress(index, title, _("Starting article"), started)) then
                 cancelled = true
                 break
             end
 
-            local built, reason = self:downloadArticle(api, bookmark, existing)
-            if built then
-                downloaded = downloaded + 1
-            elseif reason == "cancelled" then
-                -- Cancelled from the progress dialog while images were being
-                -- fetched, rather than anything going wrong.
+            local built, reason, metrics = self:downloadArticle(api, bookmark, existing,
+                function(stage, current_metrics)
+                    return Trapper:info(showProgress(index, title, stage, started, current_metrics))
+                end)
+            metrics = metrics or {}
+
+            -- A cancelled build stops this batch without counting a failure,
+            -- and never triggers local deletion/cleanup on this partial sync.
+            if reason == "cancelled" then
                 cancelled = true
                 break
+            end
+
+            local duration = syncNow() - started
+            attempt_seconds = attempt_seconds + duration
+            last_seconds = duration
+            if duration > longest_seconds then
+                longest_seconds, longest_title = duration, title
+            end
+            content_seconds = content_seconds + (metrics.content_seconds or 0)
+            cover_seconds = cover_seconds + (metrics.cover_seconds or 0)
+            image_seconds = image_seconds + (metrics.image_seconds or 0)
+            epub_seconds = epub_seconds + (metrics.epub_seconds or 0)
+
+            if built then
+                downloaded = downloaded + 1
+            elseif reason == "no_content" then
+                empty = empty + 1
             else
                 failed = failed + 1
                 first_failure = first_failure or reason
             end
+            logger.info(string.format(
+                "KaraKo timing: [%d/%d] id=%s result=%s total=%.2fs content=%.2fs cover=%.2fs images=%.2fs epub=%.2fs images_tried=%d",
+                index, #remote, tostring(bookmark.id),
+                built and "saved" or tostring(reason), duration,
+                metrics.content_seconds or 0, metrics.cover_seconds or 0,
+                metrics.image_seconds or 0, metrics.epub_seconds or 0,
+                metrics.images_attempted or 0))
         end
     end
 
-    -- Deleting local files is only safe when we have seen the whole scope. A
-    -- capped or cancelled sync cannot tell "archived elsewhere" apart from
-    -- "did not fit in this run".
+    -- Even when all selected articles were already present, honour a tap
+    -- before running the (potentially destructive) remote-delete pass.
+    if not cancelled and Trapper:info() == false then
+        cancelled = true
+    end
+
     local removed = 0
     if complete and not cancelled then
         removed = self:processRemoteDeletes(local_articles, remote_ids)
     end
 
     logger.info(string.format(
-        "KaraKo: sync done - %d fetched, %d downloaded, %d skipped, %d failed, %d removed (complete=%s cancelled=%s force=%s)",
-        #remote, downloaded, skipped, failed, removed,
-        tostring(complete), tostring(cancelled), tostring(force_redownload or false)))
+        "KaraKo: sync done - %d fetched, %d downloaded, %d present, %d empty, %d failed, %d removed (complete=%s cancelled=%s force=%s) elapsed=%.2fs",
+        #remote, downloaded, skipped, empty, failed, removed,
+        tostring(complete), tostring(cancelled), tostring(force_redownload or false),
+        syncNow() - sync_started))
 
     Trapper:reset()
     self:refreshFileManager()
@@ -1159,6 +1235,12 @@ function KaraKo:synchronize(quiet, force_redownload)
     }
     if skipped > 0 then
         table.insert(lines, T(N_("%1 already on the device.", "%1 already on the device.", skipped), skipped))
+    end
+    if empty > 0 then
+        table.insert(lines, T(N_("Skipped %1 empty article.", "Skipped %1 empty articles.", empty), empty))
+    end
+    if cancelled then
+        table.insert(lines, _("Download stopped. Saved EPUBs kept; cleanup skipped."))
     end
     if archived > 0 then
         table.insert(lines, T(N_("Archived %1 article in Karakeep.", "Archived %1 articles in Karakeep.", archived), archived))
@@ -1176,9 +1258,20 @@ function KaraKo:synchronize(quiet, force_redownload)
         table.insert(lines, T(N_("%1 finished article could not be archived, and will be retried next sync.",
             "%1 finished articles could not be archived, and will be retried next sync.", upload_failed), upload_failed))
     end
+    table.insert(lines, string.format(
+        "Time: %s (list %s, content %s, cover %s, images %s, EPUB %s)",
+        syncDuration(syncNow() - sync_started), syncDuration(list_seconds),
+        syncDuration(content_seconds), syncDuration(cover_seconds),
+        syncDuration(image_seconds), syncDuration(epub_seconds)))
+    if longest_title then
+        table.insert(lines, string.format("Slowest article: %s (%s)",
+            longest_title, syncDuration(longest_seconds)))
+    end
+    if last_seconds then
+        logger.dbg("KaraKo timing: last article", syncDuration(last_seconds))
+    end
 
     if quiet then
-        -- An automatic sync should not put a modal in front of the user.
         local Notification = require("ui/widget/notification")
         UIManager:show(Notification:new{ text = table.concat(lines, " ") })
     else
@@ -1257,11 +1350,15 @@ end
 
 --- Work down the list of possible content sources until one yields something.
 -- @treturn string|nil Article HTML.
-function KaraKo:resolveContent(api, bookmark)
+function KaraKo:resolveContent(api, bookmark, report_progress)
     local sources = ArticleUtil.contentSources(bookmark, self.prefer_archive)
     local max_bytes = (self.max_archive_mb or 4) * 1024 * 1024
 
     for _, source in ipairs(sources) do
+        if report_progress and report_progress(source.label) == false then
+            return nil, "cancelled"
+        end
+        local source_started = syncNow()
         local body
 
         if source.kind == "inline" then
@@ -1277,7 +1374,13 @@ function KaraKo:resolveContent(api, bookmark)
             end
         end
 
-        if body and body ~= "" then
+        local readable = ArticleUtil.hasReadableContent(body)
+        logger.info(string.format(
+            "KaraKo timing: content source=%s id=%s time=%.2fs bytes=%d readable=%s",
+            source.label, tostring(bookmark.id), syncNow() - source_started,
+            type(body) == "string" and #body or 0, tostring(readable)))
+
+        if readable then
             logger.dbg("KaraKo:", bookmark.id, "content from", source.label, #body, "bytes")
             if source.full_page then
                 -- A whole-page snapshot rather than an extracted article, so it
@@ -1289,7 +1392,7 @@ function KaraKo:resolveContent(api, bookmark)
         end
     end
 
-    return nil
+    return nil, "no_content"
 end
 
 --- Build one article and write it to the download folder.
@@ -1302,30 +1405,46 @@ end
 --   title edited in Karakeep since would otherwise leave a second copy behind.
 -- @treturn bool ok
 -- @treturn string|nil Reason when ok is false.
-function KaraKo:downloadArticle(api, bookmark, existing_path)
+function KaraKo:downloadArticle(api, bookmark, existing_path, report_progress)
     local Trapper = require("ui/trapper")
+    local metrics = {
+        content_seconds = 0, cover_seconds = 0, image_seconds = 0,
+        epub_seconds = 0, images_attempted = 0, images_saved = 0,
+    }
+    local function report(stage)
+        if report_progress then return report_progress(stage, metrics) end
+        return Trapper:info(stage)
+    end
     local content = bookmark.content or {}
     local title = bookmark.title or content.title or content.url
 
-    local body_html
-    if content.type == "text" then
-        -- text bookmarks carry their body directly.
-        body_html = EpubBuilder.markdownToHtml(content.text or "")
-    else
-        body_html = self:resolveContent(api, bookmark)
+    if report(_("Getting article content")) == false then
+        return false, "cancelled", metrics
     end
 
-    if not body_html or body_html == "" then
-        logger.info("KaraKo: no readable content for", bookmark.id, content.url)
-        return false, _("no readable content")
+    local content_started = syncNow()
+    local body_html, content_error
+    if content.type == "text" then
+        body_html = EpubBuilder.markdownToHtml(content.text or "")
+    else
+        body_html, content_error = self:resolveContent(api, bookmark, function(source)
+            return report("Content: " .. source)
+        end)
+    end
+    metrics.content_seconds = syncNow() - content_started
+
+    if content_error == "cancelled" then
+        return false, "cancelled", metrics
+    end
+    if not ArticleUtil.hasReadableContent(body_html) then
+        logger.info("KaraKo: skipping empty article", bookmark.id, content.url)
+        return false, "no_content", metrics
     end
 
     local filepath = existing_path
         or ffiUtil.joinPath(self.directory, ArticleUtil.buildFilename(bookmark.id, title))
 
-    -- KaraKo publication + cover patch (2026-10)
-    -- Prefer Karakeep's actual bannerImage asset; older API responses may
-    -- expose the preferred banner as content.imageAssetId instead.
+    -- Preserve the existing publication and banner-image handling.
     local cover_asset_id
     local asset_sets = { content.assets or {}, bookmark.assets or {} }
     for _, assets in ipairs(asset_sets) do
@@ -1338,33 +1457,47 @@ function KaraKo:downloadArticle(api, bookmark, existing_path)
         if cover_asset_id then break end
     end
     cover_asset_id = cover_asset_id or content.imageAssetId
+
     local cover_data
     if cover_asset_id then
-        -- Uses KaraKo's existing authenticated Karakeep asset client.
-        -- Covers are limited independently from article inline images.
+        if report(_("Downloading cover image")) == false then
+            return false, "cancelled", metrics
+        end
+        local cover_started = syncNow()
         cover_data = self:fetchAsset(api, cover_asset_id, 2 * 1024 * 1024)
+        metrics.cover_seconds = syncNow() - cover_started
+        logger.info(string.format("KaraKo timing: cover id=%s elapsed=%.2fs",
+            tostring(bookmark.id), metrics.cover_seconds))
     end
+
+    if report(_("Building EPUB")) == false then
+        return false, "cancelled", metrics
+    end
+    local build_started = syncNow()
     local ok, err = EpubBuilder.build(bookmark, filepath, {
         body_html = body_html,
         include_images = self.download_images,
         cover_data = cover_data,
         max_images = self.max_images,
-        -- Returned, not discarded: Trapper:info() answers false when the reader
-        -- taps to cancel, which abandons the build rather than making them wait
-        -- out every image first.
         progress = function(message)
-            return Trapper:info(message, true, true)
+            return report(message)
+        end,
+        image_result = function(seconds, saved)
+            metrics.image_seconds = metrics.image_seconds + seconds
+            metrics.images_attempted = metrics.images_attempted + 1
+            if saved then metrics.images_saved = metrics.images_saved + 1 end
         end,
     })
+    metrics.epub_seconds = syncNow() - build_started
 
     if not ok then
-        if err ~= "cancelled" then
+        if err ~= "cancelled" and err ~= "no_content" then
             logger.err("KaraKo: could not build EPUB for", bookmark.id, "at", filepath, "-", tostring(err))
         end
-        return false, tostring(err)
+        return false, tostring(err), metrics
     end
 
-    return true
+    return true, nil, metrics
 end
 
 --- Archive finished articles in Karakeep and push their highlights.

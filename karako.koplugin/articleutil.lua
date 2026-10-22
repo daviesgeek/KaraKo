@@ -280,6 +280,14 @@ function ArticleUtil.htmlToText(html)
     return s
 end
 
+--- Check whether an HTML fragment contains readable prose, not just empty tags,
+-- whitespace, hidden script/style content, or an image without accompanying text.
+-- Use the same sanitisation and entity decoding as KOReader's article text.
+function ArticleUtil.hasReadableContent(html)
+    local text = ArticleUtil.htmlToText(html):gsub("\194\160", " ")
+    return text:find("%S") ~= nil
+end
+
 --- Collapse runs of whitespace, so text captured on device can be compared with
 -- text rendered on the server.
 -- @tparam string|nil s

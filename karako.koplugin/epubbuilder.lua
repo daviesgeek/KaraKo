@@ -351,7 +351,7 @@ function EpubBuilder.build(bookmark, filepath, opts)
     local title = bookmark.title or content.title or content.url or "Untitled"
     local body_html = opts.body_html or content.htmlContent
 
-    if not body_html or body_html == "" then
+    if not ArticleUtil.hasReadableContent(body_html) then
         return false, "no_content"
     end
 
@@ -370,6 +370,7 @@ function EpubBuilder.build(bookmark, filepath, opts)
     -- which is what `budget` bounds.
     local images, image_data = {}, {}
     local budget = opts.max_image_bytes_total or MAX_IMAGE_TOTAL_BYTES
+    local clock = require("socket").gettime or os.time
 
     for index, candidate in ipairs(candidates) do
         if opts.progress then
@@ -380,6 +381,7 @@ function EpubBuilder.build(bookmark, filepath, opts)
             if go_on == false then return false, "cancelled" end
         end
 
+        local image_started = clock()
         local data, why
         if budget <= 0 then
             why = "image budget for this article is spent"
@@ -402,6 +404,9 @@ function EpubBuilder.build(bookmark, filepath, opts)
         else
             logger.dbg("KaraKo: dropping image", candidate.src,
                 media_type or why or "unfetchable")
+        end
+        if opts.image_result then
+            opts.image_result(clock() - image_started, data ~= nil and media_type ~= nil)
         end
     end
 
@@ -447,6 +452,12 @@ function EpubBuilder.build(bookmark, filepath, opts)
         "</body></html>",
     }, "\n")
 
+    -- This step can be expensive on large captured pages. Report it separately
+    -- from image fetching and writing the final zip, and allow cancellation.
+    if opts.progress and opts.progress("Formatting article…") == false then
+        return false, "cancelled"
+    end
+
     -- crengine turns arbitrary crawler HTML into balanced XHTML. Without this,
     -- a single unclosed <p> from the source site breaks the whole EPUB.
     local balanced_ok, balanced = pcall(function()
@@ -461,6 +472,11 @@ function EpubBuilder.build(bookmark, filepath, opts)
 
     -- The XML declaration goes on afterwards: crengine does not emit one.
     xhtml = [[<?xml version="1.0" encoding="UTF-8"?>]] .. "\n" .. xhtml
+
+    -- Last cancellation checkpoint before creating the archive on disk.
+    if opts.progress and opts.progress("Writing EPUB…") == false then
+        return false, "cancelled"
+    end
 
     local Archiver = require("ffi/archiver")
     local lfs = require("libs/libkoreader-lfs")

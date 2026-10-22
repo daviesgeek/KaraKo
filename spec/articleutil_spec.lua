@@ -197,6 +197,21 @@ describe("htmlToText", function()
     end)
 end)
 
+describe("hasReadableContent", function()
+    it("skips missing, whitespace-only and markup-only articles", function()
+        assertEqual(ArticleUtil.hasReadableContent(nil), false)
+        assertEqual(ArticleUtil.hasReadableContent("  \n  "), false)
+        assertEqual(ArticleUtil.hasReadableContent("<div><p> &nbsp; &#160; </p></div>"), false)
+        assertEqual(ArticleUtil.hasReadableContent("<script>Not an article</script>"), false)
+        assertEqual(ArticleUtil.hasReadableContent('<img src="example.jpg"/>'), false)
+    end)
+
+    it("keeps articles containing real text", function()
+        assertEqual(ArticleUtil.hasReadableContent("<p>Actual article content</p>"), true)
+        assertEqual(ArticleUtil.hasReadableContent("<p>&#65;rticle text</p>"), true)
+    end)
+end)
+
 describe("findTextOffsets", function()
     local text = "The quick brown fox jumps over the lazy dog near the river bank today"
 

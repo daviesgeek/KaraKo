@@ -88,6 +88,17 @@ describe("markdownToHtml", function()
     end)
 end)
 
+describe("build empty content", function()
+    it("rejects empty HTML before creating an archive", function()
+        local bookmark = { id = "empty", content = { type = "link" } }
+        local ok, err = EpubBuilder.build(bookmark, "should-not-be-written.epub", {
+            body_html = "<p> &nbsp; &#160; </p>",
+        })
+        assertEqual(ok, false)
+        assertEqual(err, "no_content")
+    end)
+end)
+
 describe("buildDocument", function()
     local bookmark = {
         id = "abc123",
