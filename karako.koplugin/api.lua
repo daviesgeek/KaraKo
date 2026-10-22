@@ -1,7 +1,7 @@
 --[[--
 Minimal Karakeep REST client.
 
-Covers only what the plugin needs: listing bookmarks for a sync scope, fetching
+Covers only what the plugin needs: listing and creating bookmarks, fetching
 readable content and assets, and pushing read status, tags and highlights back.
 
 See https://docs.karakeep.app/api/karakeep-api/ for the full API.
@@ -241,6 +241,18 @@ function KarakeepApi:getBookmarkPage(opts)
     end
 
     return self:call("GET", path, { query = query })
+end
+
+--- Save an external HTTP(S) link to Karakeep.
+-- A URL already in Karakeep returns HTTP 200, also treated as success.
+-- Requires the Bookmarks read/write scope on the API key.
+-- @tparam string url
+-- @treturn bool ok
+-- @treturn table|string The bookmark or an error code.
+function KarakeepApi:createBookmark(url)
+    return self:call("POST", "/bookmarks", {
+        body = { type = "link", url = url },
+    })
 end
 
 --- Fetch a single bookmark.

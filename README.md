@@ -20,12 +20,27 @@ same problem for a different read-it-later service.
 
 - Downloads unread bookmarks as EPUBs, built on device from Karakeep's crawled
   article HTML, with images embedded.
+- Saves external links from KOReader's link menu directly to Karakeep.
 - Syncs everything unarchived, or just one Karakeep list or tag.
 - Archives an article in Karakeep once you finish it, optionally tagging it and
   deleting the local copy.
 - Sends the highlights you make in KOReader back to Karakeep.
 - Optionally syncs when Wi-Fi connects, without interrupting your reading.
 - Cleans up local copies of articles you archived elsewhere.
+
+## Save links from KOReader
+
+When reading a book or article, tap an external HTTP(S) link and choose
+**Add to Karakeep**. KaraKO sends the URL to your configured server using the
+same API key as syncing; you do not need another plugin or configuration.
+The server handles crawling the linked page. An already-saved URL is treated
+as success (Karakeep does not create another copy).
+
+This action works whenever the server address and API key are set; a download
+folder is **not** required. It uses the **Bookmarks: Read/write** API key scope.
+If **Add to Wallabag** is also shown, disable the Wallabag plugin in KOReader's
+plugin manager and restart KOReader to remove that separate menu entry.
+Links are saved while online; KaraKO does not queue links when offline.
 
 ## Requirements
 

@@ -78,6 +78,21 @@ function KaraKo:init()
     self:setupAutoSync()
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
+
+    -- KOReader's external-link dialog also hosts Wallabag's "Add to" action.
+    -- Register our own entry there; no Wallabag plugin or separate credentials
+    -- are needed. The hook is reader-only (the file manager has no ui.link).
+    if self.ui and self.ui.link then
+        self.ui.link:addToExternalLinkDialog("26_karako", function(this, link_url)
+            return {
+                text = _("Add to Karakeep"),
+                callback = function()
+                    UIManager:close(this.external_link_dialog)
+                    self:onAddKarakoLink(link_url)
+                end,
+            }
+        end)
+    end
 end
 
 --- Attach or detach the network event handler.
@@ -930,6 +945,48 @@ Only articles still unarchived in Karakeep come back; anything archived there is
         end,
     })
 
+    return true
+end
+
+--- Save a URL from KOReader's external-link dialog to Karakeep.
+-- This is independent of the download folder: saving links only needs the
+-- server address, API key, and the Bookmarks read/write API permission.
+function KaraKo:onAddKarakoLink(link_url)
+    if type(link_url) ~= "string" or not link_url:match("^https?://[^%s]+$") then
+        UIManager:show(InfoMessage:new{
+            text = _("Only HTTP and HTTPS links can be saved to Karakeep."),
+        })
+        return true
+    end
+
+    if self.server_url == "" or self.api_token == "" then
+        UIManager:show(InfoMessage:new{
+            text = _("Set the KaraKo server address and API key first."),
+        })
+        return true
+    end
+
+    NetworkMgr:runWhenOnline(function()
+        local ok, err, code = self:getApi():createBookmark(link_url)
+        if ok then
+            -- A pre-existing URL is also success (Karakeep returns HTTP 200).
+            UIManager:show(InfoMessage:new{
+                text = _("Link is in Karakeep."),
+                timeout = 3,
+            })
+        else
+            logger.err("KaraKo: failed to add link to Karakeep", err, code)
+            local message
+            if code == 401 or code == 403 then
+                message = _("Karakeep rejected the API key or its Bookmarks permission.")
+            elseif code then
+                message = T(_("Could not save link to Karakeep (HTTP %1)."), code)
+            else
+                message = _("Could not connect to Karakeep to save the link.")
+            end
+            UIManager:show(InfoMessage:new{ text = message })
+        end
+    end)
     return true
 end
 

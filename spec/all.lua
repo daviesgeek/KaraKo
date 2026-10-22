@@ -10,5 +10,6 @@ local Runner = require("spec.runner")
 require("spec.articleutil_spec")
 require("spec.config_spec")
 require("spec.epubbuilder_spec")
+require("spec.linksave_spec")
 
 os.exit(Runner.report() and 0 or 1)
